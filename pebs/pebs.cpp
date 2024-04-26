@@ -1,9 +1,9 @@
 #define _GNU_SOURCE
 #include "pebs.h"
-#define HIGHMARK 200
-#define LOWMARK 30
-#define INTERVAL 5000000000
-#define MAXIMUM_MIGRATION 500
+#define HIGHMARK 50
+#define LOWMARK 5
+#define INTERVAL 10000000000
+#define MAXIMUM_MIGRATION 100
 #define SOC1 24
 #include <condition_variable>
 
@@ -11,8 +11,7 @@ using namespace std;
 
 // DEFINITION
 CPU_TID cputid[TIDNUM];
-__u64 event[5];
-int split_enable ;
+__u64 event[4];
 
 // exclusive cpus for QEMU thread and PEBS threads
 // SAMPLECPU 33, defined in pebs.h
@@ -32,25 +31,8 @@ vector<__u64 > migrate;
 vector<vector<__u64 >> split;
 char buffer[40960];
 
-pthread_mutex_t mutex;
+FILE* fp;
 
-std::map<__u64  , int> soc1 ;
-	std::map<__u64  , int> soc2 ;
-	std::set<__u64 > s_s1 ;
-	std::set<__u64 > s_s2 ;
-
-	std::map<__u64  , int> soc1_cp ;
-	std::map<__u64  , int> soc2_cp ;
-	std::set<__u64 > s_s1_cp ;
-	std::set<__u64 > s_s2_cp ;
-
-struct thread_arg{
-	std::map<__u64  , int>* soc1;
-	std::map<__u64  , int>* soc2;
-
-	std::set<__u64 >* s_s1;
-	std::set<__u64 >* s_s2;
-};
 
 
 void signal_handler(int signum)
@@ -67,13 +49,12 @@ void signal_handler(int signum)
 }
 
 
-void init(const char* filename, int split_t)
+void init(const char* filename)
 {
 	// cputid should be already initialized inside main() ahead
 	__u64  ts = time(NULL);
-	split_enable = split_t;
 	// snprintf(filename, sizeof(filename), "profiling_%lu", ts);
-	FILE* fp = fopen(filename, "w");
+	fp = fopen(filename, "w");
 	if (!fp) {
 		fprintf(stderr, "fopen file[%s] error!\n", filename);
 		assert(fp != NULL);
@@ -109,7 +90,6 @@ void init(const char* filename, int split_t)
 void perf_setup()
 {
 	// arrt1 - READ; attr2 - WRITE
-	// system("echo 0 > /proc/sys/kernel/numa_balancing");
 	struct perf_event_attr attr[5];
 	for (int i=0;i<TIDNUM;++i) {
 		for (int j=START;j<NPBUFTYPES;j++){
@@ -139,205 +119,7 @@ void perf_setup()
 	} // end of setup events for each TID
 }
 
-void analysis_profiling_results(vector< __u64 > *migrate,
-								vector<vector< __u64 >> *split, 
-								set< __u64 > *s_s1,
-								map< __u64, int > *soc1
-								){
 
-	__u64  base = 0; 
-	base = *(s_s1->begin()); 
-	__u64  base_pfn = base >> 9;
-	__u64  pfn;
-
-	int total, average, max, min;
-    total = average = max = min = 0;
-	std::priority_queue<int> pq;
-	int i = 0 ;
-	for (auto it = s_s1->begin(); it != s_s1->end();it++){
-		pfn = *it>>9;
-		if (pfn != base_pfn){
-			// migrate
-			if (total > HIGHMARK){
-				migrate->push_back(*it);
-			}
-			//split
-			else if (total < LOWMARK){
-				//Directly discard this record
-				;
-			}
-			else{
-				int avearge = total / i;
-				vector<__u64 > tmp;
-				while (!pq.empty()){
-					tmp.push_back(pq.top());
-					pq.pop();
-				}
-				split->push_back(tmp);
-			}
-			base_pfn = pfn;
-		}
-		else{
-			if(pq.size() < 5){
-				pq.push(*it);
-			}
-			else{
-				if (pq.top() < (*soc1)[*it]){
-					pq.pop();
-					pq.push(*it);
-				}
-			} 
-			total += (*soc1)[*it];
-			if ((*soc1)[*it] < min){
-				min = (*soc1)[*it];
-			}
-			if ((*soc1)[*it] > max){
-				max = (*soc1)[*it];
-			}
-			i++;
-		}
-	}
-	printf("finish analysis\n");
-}
-
-void *analysis_thread_func(void* args)
-{
-	// set affinity
-	struct thread_arg* targ = (struct thread_arg*)args;
-	cpu_set_t cpuset;
-	CPU_ZERO(&cpuset);
-	CPU_SET(ANALYSISCPU, &cpuset);
-	pthread_t thread = pthread_self();
-	int affinity_ret = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
-	assert(affinity_ret==0); //if (affinity_ret)	fprintf(stderr, "pthread_setaffinity_np failed!\n");
-	
-	__u64  start_pfn = 0; 
-	start_pfn = *(targ->s_s1->begin()); 
-	__u64  base_pfn = start_pfn >> 9;
-	__u64  pfn;
-
-	int total, average, max, min;
-	total = average = max = min = 0;
-	std::priority_queue<int> pq;
-	migrate.clear();
-	split.clear();
-	
-	analysis_profiling_results(&migrate, &split, targ->s_s1, targ->soc1);
-	// analysis_profiling_results(&migrate, &split, targ->s_s2, targ->soc2);
-
-	printf("Huge page migrate size %d \n", migrate.size());
-	printf("Huge page split size %d \n", split.size());
-
-
-	
-	int index = 0;
-	int mi_num = 0;
-	for (auto it = migrate.begin(); it != migrate.end();it++){
-		std::snprintf(buffer+index, sizeof(buffer), "%.16llx ", *it);
-		index += 17;
-		mi_num++;
-		if(mi_num ==  MAXIMUM_MIGRATION){
-			printf("Reach the maximum page num\n");
-			// index -= 17;
-			break;
-		}
-	}
-	// printf("%s\n", buffer);
-	// output to the file
-	// here we will wait for the synchronization from the kernel space.
-	std::unique_lock<std::mutex> lk(mutex1);
-	printf("wait for the kernel to be finished\n");
-	cv.wait(lk, []{return kernel_finished;});
-	kernel_finished = false;
-	lk.unlock();
-
-	int flag1 = 0;
-	int flag2 = 0;
-	index = 0;
-	if(index >=17){
-		buffer[index-1] = '\0';
-		int cur = 0 ;
-		for (; cur < index; cur+=1020){
-			buffer[cur-1] ='\0';
-			FILE* fp = fopen("/proc/migrate_huge_page", "w");
-			if(fp != NULL){
-				fprintf(fp, "%s", buffer+cur);
-				fclose(fp);
-			}
-			else {
-				printf("can not open /proc/migrate_huge_page\n");
-			}
-		}
-	}
-	else{
-		buffer[0] = 'N';
-		buffer[1] = '\0';
-		FILE *fp = fopen("/proc/migrate_huge_page", "w");
-		if(fp != NULL){
-			fprintf(fp,"N");
-			fclose(fp);
-		}
-		else {
-			printf("can not open /proc/migrate_huge_page\n");
-		}
-	}
-	index = 0;
-	mi_num = 0;
-	for (auto it = split.begin(); it != split.end();it++){
-		for (auto it2 = it->begin(); it2 != it->end();it2++){
-			std::snprintf(buffer+index, sizeof(buffer), "%.16llx ", *it2);
-			index += 17;
-			if(mi_num == MAXIMUM_MIGRATION){
-				printf("Reach the maximum page num\n");
-				break;
-			}
-		}
-		if (index > 0){buffer[index-1] = '\n';}
-	}
-	if (!split_enable)
-	{
-		index = 0;
-	}
-	// index = 0;
-	if(index >= 17){
-		buffer[index-1] = '\0';
-		int cur = 0 ;
-		for (; cur < index; cur+=1020){
-			buffer[cur-1] ='\0';
-			FILE* fp = fopen("/proc/base_page", "w");
-			if(fp != NULL){
-				fprintf(fp, "%s", buffer+cur);
-				fclose(fp);
-			}
-			else {
-				printf("can not open /proc/base_page\n");
-			}
-		}
-	}
-	else{
-		buffer[0] = 'N';
-		buffer[1] = '\0';
-		FILE* fp = fopen("/proc/base_page", "w");
-		if(fp != NULL){
-			fprintf(fp,"NNNN");
-			printf("%s %d \n", buffer, sizeof(buffer));
-
-			fclose(fp);
-		}
-		else {
-			printf("can not open /proc/base_page\n");
-		}
-	}
-
-
-	//TODO: we should know thedmesgre should have synchronization between kernel and user space.
-
-	targ->soc1->clear();
-	targ->s_s1->clear();
-	targ->soc2->clear();
-	targ->s_s2->clear();
-	printf("done\n");
-}
 
 void *sample_thread_func(void *arg)
 {
@@ -356,37 +138,7 @@ void *sample_thread_func(void *arg)
 	// set the sychronization signal handler
 	signal(SIGUSR1, signal_handler);
 
-	// We should set the pid of this profiling threads
-
-	FILE *fp = fopen("/proc/profiling_pid", "w");
-	if(fp != NULL){
-		int pid = getpid();
-		fprintf(fp, "%d\n", pid);
-		fclose(fp);
-	}
-	else {
-		printf("can not open /proc/profiling_pid\n");
-		exit(1);
-	}
-
-	// We need memory to store the profiling records
-
-	std::map<__u64  , int> *p_soc1, *p_soc2; ;
-	std::set<__u64 > *p_s_s1, *p_s_s2;
 	
-	__u64  base_addr ;
-	__u64  huge_addr ;
-
-	// pthread_mutex_init(mutex1, NULL);
-	__u64  cur_time = 0;
-	struct thread_arg targ;
-	pthread_t analysis_thread;
-
-	p_soc1 = &soc1;
-	p_soc2 = &soc2;
-	p_s_s1 = &s_s1;
-	p_s_s2 = &s_s2;
-
 	int switch_on = 0;
 	__u64 addr;
 
@@ -412,81 +164,11 @@ void *sample_thread_func(void *arg)
 					switch (ph->type) {
 						case PERF_RECORD_SAMPLE:
 							ps = (struct perf_sample*)ph; assert(ps != NULL);
-							if(cur_time == 0){
-								cur_time = ps->time;
-							}
-							else{
-								if (index < SOC1){
-									addr = (ps->addr)>>12 ;
-									if (i == L_PM || i == R_PM){
-										if(p_soc1->find(addr) != p_soc1->end()){
-											(*p_soc1)[addr] = 1;
-											p_s_s1->insert(addr);
-										}
-										else{
-											(*p_soc1)[addr] +=1;
-										}
-									}
-								}
-								else{
-									addr = (ps->addr)>>12;
-									if (i == L_PM || i == R_PM){
-										if(p_soc2->find(addr)!=p_soc2->end()){
-											(*p_soc2)[addr] = 1;
-											p_s_s2->insert(addr);
-										}
-										else{
-											(*p_soc2)[addr] +=1;
-										}
-									}
-								}
-							}
-							// printf( "%llu %llu, %d %d\n", (void*)(ps->addr), ps->time, index, i);
-							// printf("%lld\n", ps->time - cur_time - INTERVAL);
-							if( llabs(ps->time - cur_time) > INTERVAL){
-								printf("%llu\n", llabs(ps->time - cur_time));
-								printf("get in\n");
-								cur_time = ps->time;
-								// Now we start the analysis threads
-								targ.soc1 = p_soc1;
-								targ.soc2 = p_soc2;	
-								targ.s_s1 = p_s_s1;
-								targ.s_s2 = p_s_s2;
-
-								// if (!pthread_tryjoin_np(analysis_thread, NULL)){
-									// this is unusual case.
-								pthread_join(analysis_thread, NULL);
-								printf("join\n");
-								// }
 							
-								if (switch_on == 0){
-									printf("start switch 0\n");
-									p_soc1 = &soc1_cp;
-									p_soc2 = &soc2_cp;
-									p_s_s1 = &s_s1_cp;
-									p_s_s2 = &s_s2_cp;
-								   	switch_on = 1;
-								}
-								else{
-									printf("start switch 1 \n");
-									p_soc1 = &soc1;
-									p_soc2 = &soc2;
-									p_s_s1 = &s_s1;
-									p_s_s2 = &s_s2;
-									switch_on = 0;
-								}
-								int ret = pthread_create(&analysis_thread, NULL, analysis_thread_func, (void*)&targ);
-								if (ret != 0) {
-									fprintf(stderr, "pthread_create analysis failed!\n");
-									exit(1);
-								}
-								
-								// change the profiling storage for profiling results.
-							}
 							// Here should be a condition that we should start the analysis.
-							// if (ps->addr!=0 ){
-							//    fprintf(fp, "%llu %llu, %d %d\n", (void*)(ps->addr), ps->time, index, i);
-							// }
+							if (ps->addr!=0 ){
+							   fprintf(fp, "%llu %llu, %d %d\n", (void*)(ps->addr), ps->time, index, i);
+							}
 							break;
 						case PERF_RECORD_THROTTLE:
 							printf("PERF_RECORD_THROTTL\n");
